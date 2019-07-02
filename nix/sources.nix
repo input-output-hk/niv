@@ -23,29 +23,31 @@ with rec
 
   # fetchTarball version that is compatible between all the versions of Nix
   builtins_fetchTarball =
-      { url, sha256 }@attrs:
+      { url, sha256 ? null }@attrs:
       let
         inherit (builtins) lessThan nixVersion fetchTarball;
       in
-        if lessThan nixVersion "1.12" then
+        if sha256 == null || lessThan nixVersion "1.12" then
           fetchTarball { inherit url; }
         else
           fetchTarball attrs;
 
   # fetchurl version that is compatible between all the versions of Nix
   builtins_fetchurl =
-      { url, sha256 }@attrs:
+      { url, sha256 ? null }@attrs:
       let
         inherit (builtins) lessThan nixVersion fetchurl;
       in
-        if lessThan nixVersion "1.12" then
+        if sha256 == null || lessThan nixVersion "1.12" then
           fetchurl { inherit url; }
         else
           fetchurl attrs;
 
   # A wrapper around pkgs.fetchzip that has inspectable arguments,
   # annoyingly this means we have to specify them
-  fetchzip = { url, sha256 }@attrs: pkgs.fetchzip attrs;
+  fetchzip = { url, sha256  ? null }@attrs: if sha256 == null
+    then builtins.fetchTarball { inherit url; }
+    else pkgs.fetchzip attrs;
 
   # A wrapper around pkgs.fetchurl that has inspectable arguments,
   # annoyingly this means we have to specify them
@@ -80,14 +82,33 @@ with rec
     };
 };
 # NOTE: spec must _not_ have an "outPath" attribute
-mapAttrs (_: spec:
+mapAttrs (name: spec:
   if builtins.hasAttr "outPath" spec
   then abort
     "The values in sources.json should not have an 'outPath' attribute"
   else
-    if builtins.hasAttr "url" spec && builtins.hasAttr "sha256" spec
-    then
-      spec //
-      { outPath = callFunctionWith spec (getFetcher spec) { }; }
-    else spec
+    let
+      host = if (name == "nixpkgs") then "custom_nixpkgs" else name;
+      tryFromPath = builtins.tryEval (builtins.findFile builtins.nixPath host);
+      defaultSpec = (if builtins.hasAttr "url" spec && builtins.hasAttr "sha256" spec
+        then spec //
+            { outPath = callFunctionWith spec (getFetcher spec) { }; }
+        else spec) // (if tryFromPath.success
+          then {
+            outPath = builtins.trace "using search host <${host}>" tryFromPath.value;
+          }
+          else {});
+    in if builtins.hasAttr "rev" spec && builtins.hasAttr "url" spec then
+      defaultSpec //
+        { revOverride = rev: if (rev == null) then defaultSpec else
+              let
+                spec' = removeAttrs (spec // {
+                  rev = rev;
+                  url = builtins.replaceStrings [defaultSpec.rev] [rev] defaultSpec.url;
+                }) [ "sha256" ];
+              in
+                spec' //
+                { outPath = callFunctionWith spec' (getFetcher spec') { };  };
+        }
+      else defaultSpec
   ) sources

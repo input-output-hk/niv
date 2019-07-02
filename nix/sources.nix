@@ -21,6 +21,19 @@ with rec
         add a package called "nixpkgs" to your sources.json.
     '';
 
+  sources_gitignore =
+    if builtins.hasAttr "gitignore" sources
+    then sources.gitignore
+    else abort
+    ''
+        Please add "gitignore" to your sources.json:
+        niv add hercules-ci/gitignore
+    '';
+
+  inherit (import (builtins_fetchTarball { inherit (sources_gitignore) url sha256; }) {
+    inherit (pkgs) lib;
+  }) gitignoreSource;
+
   # fetchTarball version that is compatible between all the versions of Nix
   builtins_fetchTarball =
       { url, sha256 ? null }@attrs:
@@ -94,8 +107,11 @@ mapAttrs (name: spec:
         then spec //
             { outPath = callFunctionWith spec (getFetcher spec) { }; }
         else spec) // (if tryFromPath.success
-          then {
-            outPath = builtins.trace "using search host <${host}>" tryFromPath.value;
+          then let path = tryFromPath.value;
+          in {
+            outPath = builtins.trace "using search host <${host}>" (
+              if pkgs.lib.hasPrefix "/nix/store" (builtins.toString path)
+              then path else gitignoreSource path);
           }
           else {});
     in if builtins.hasAttr "rev" spec && builtins.hasAttr "url" spec then

@@ -191,7 +191,7 @@ cmdInit = do
         , ( pathNixSourcesJson
           , \path -> do
               createFile path initNixSourcesJsonContent
-              -- Imports @niv@ and @nixpkgs@ (19.03)
+              -- Imports @niv@, @nixpkgs@ (19.03) and @gitignore@
               say "Importing 'niv' ..."
               cmdAdd Nothing (PackageName "nmattia/niv", PackageSpec HMS.empty)
               say "Importing 'nixpkgs' ..."
@@ -199,6 +199,8 @@ cmdInit = do
                 (Just (PackageName "nixpkgs"))
                 ( PackageName "NixOS/nixpkgs-channels"
                 , PackageSpec (HMS.singleton "branch" "nixos-19.03"))
+              say "Importing 'gitignore' ..."
+              cmdAdd Nothing (PackageName "hercules-ci/gitignore", PackageSpec HMS.empty)
           , \path _content -> dontCreateFile path)
         ] $ \(path, onCreate, onUpdate) -> do
             exists <- Dir.doesFileExist path

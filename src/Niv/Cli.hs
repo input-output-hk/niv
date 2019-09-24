@@ -191,9 +191,12 @@ cmdInit = do
         , ( pathNixSourcesJson
           , \path -> do
               createFile path initNixSourcesJsonContent
-              -- Imports @niv@, @nixpkgs@ (19.03) and @gitignore@
+              -- Imports @niv@ (iohk fork), @nixpkgs@ (19.03) and @gitignore@
               say "Importing 'niv' ..."
-              cmdAdd Nothing (PackageName "nmattia/niv", PackageSpec HMS.empty)
+              cmdAdd
+                Nothing
+                ( PackageName "input-output-hk/niv"
+                , PackageSpec (HMS.singleton "branch" "iohk"))
               say "Importing 'nixpkgs' ..."
               cmdAdd
                 (Just (PackageName "nixpkgs"))

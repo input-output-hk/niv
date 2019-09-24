@@ -12,7 +12,7 @@ Painless dependencies for [Nix] projects. Read more in the [Getting started](#ge
 ## Install
 
 ``` bash
-$ nix-env -iA niv -f https://github.com/nmattia/niv/tarball/master
+$ nix-env -iA niv -f https://github.com/input-output-hk/niv/tarball/iohk
 ```
 
 ## Build
@@ -210,7 +210,7 @@ Available commands:
   init                     Initialize a Nix project. Existing files won't be
                            modified.
   add                      Add dependency
-  show                     
+  show
   update                   Update dependencies
   modify                   Modify dependency
   drop                     Drop dependency
@@ -295,7 +295,7 @@ Available options:
 #### Init
 
 ```
-Usage: niv init 
+Usage: niv init
   Initialize a Nix project. Existing files won't be modified.
 
 Available options:

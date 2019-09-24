@@ -12,7 +12,7 @@ Painless dependencies for [Nix] projects. Read more in the [Getting started](#ge
 ## Install
 
 ``` bash
-$ nix-env -iA niv -f https://github.com/nmattia/niv/tarball/master
+$ nix-env -iA niv -f https://github.com/input-output-hk/niv/tarball/iohk
 ```
 
 ## Build

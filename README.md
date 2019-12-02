@@ -199,7 +199,7 @@ $ niv update ghc -v 8.6.2
 ```
 niv - dependency manager for Nix projects
 
-version: 0.2.1
+version: 0.2.5
 
 Usage: niv COMMAND
 
@@ -209,7 +209,7 @@ Available options:
 Available commands:
   init                     Initialize a Nix project. Existing files won't be
                            modified.
-  add                      Add dependency
+  add                      Add a GitHub dependency
   show
   update                   Update dependencies
   modify                   Modify dependency
@@ -226,14 +226,18 @@ Examples:
   niv add NixOS/nixpkgs-channels -n nixpkgs -b nixos-19.03
   niv add my-package -v alpha-0.1 -t http://example.com/archive/<version>.zip
 
-Usage: niv add [-n|--name NAME] PACKAGE ([-a|--attribute KEY=VAL] |
-               [-b|--branch BRANCH] | [-o|--owner OWNER] | [-r|--repo REPO] |
-               [-v|--version VERSION] | [-t|--template URL] | [-T|--type TYPE])
-  Add dependency
+Usage: niv add PACKAGE [-n|--name NAME] ([-a|--attribute KEY=VAL] |
+               [-s|--string-attribute KEY=VAL] | [-b|--branch BRANCH] |
+               [-o|--owner OWNER] | [-r|--repo REPO] | [-v|--version VERSION] |
+               [-t|--template URL] | [-T|--type TYPE])
+  Add a GitHub dependency
 
 Available options:
   -n,--name NAME           Set the package name to <NAME>
-  -a,--attribute KEY=VAL   Set the package spec attribute <KEY> to <VAL>
+  -a,--attribute KEY=VAL   Set the package spec attribute <KEY> to <VAL>, where
+                           <VAL> may be JSON.
+  -s,--string-attribute KEY=VAL
+                           Set the package spec attribute <KEY> to <VAL>.
   -b,--branch BRANCH       Equivalent to --attribute branch=<BRANCH>
   -o,--owner OWNER         Equivalent to --attribute owner=<OWNER>
   -r,--repo REPO           Equivalent to --attribute repo=<REPO>
@@ -245,24 +249,32 @@ Available options:
                            inferred from the suffix of the URL.
   -h,--help                Show this help text
 
+Experimental commands:
+  git                      Add a git dependency. Experimental.
+  github                   Add a GitHub dependency
+
 ```
 
 #### Update
 
 ```
 Examples:
+  
+  niv update                     # update all packages
+  niv update nixpkgs             # update nixpkgs
+  niv update my-package -v beta-0.2 # update my-package to version "beta-0.2"
 
-  niv update
-  niv update nixpkgs
-  niv update my-package -v beta-0.2
-
-Usage: niv update [PACKAGE] ([-a|--attribute KEY=VAL] | [-b|--branch BRANCH] |
+Usage: niv update [PACKAGE] ([-a|--attribute KEY=VAL] |
+                  [-s|--string-attribute KEY=VAL] | [-b|--branch BRANCH] |
                   [-o|--owner OWNER] | [-r|--repo REPO] | [-v|--version VERSION]
                   | [-t|--template URL] | [-T|--type TYPE])
   Update dependencies
 
 Available options:
-  -a,--attribute KEY=VAL   Set the package spec attribute <KEY> to <VAL>
+  -a,--attribute KEY=VAL   Set the package spec attribute <KEY> to <VAL>, where
+                           <VAL> may be JSON.
+  -s,--string-attribute KEY=VAL
+                           Set the package spec attribute <KEY> to <VAL>.
   -b,--branch BRANCH       Equivalent to --attribute branch=<BRANCH>
   -o,--owner OWNER         Equivalent to --attribute owner=<OWNER>
   -r,--repo REPO           Equivalent to --attribute repo=<REPO>

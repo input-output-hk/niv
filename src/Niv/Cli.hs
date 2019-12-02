@@ -1,5 +1,4 @@
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -11,28 +10,27 @@ module Niv.Cli where
 
 import Control.Applicative
 import Control.Monad
-import Data.Aeson (FromJSON, FromJSONKey, ToJSON, ToJSONKey, (.=))
+import Data.Aeson ((.=))
 import Data.Char (isSpace)
-import Data.FileEmbed (embedFile)
+import Data.HashMap.Strict.Extended
 import Data.Hashable (Hashable)
-import Data.Maybe (fromMaybe)
 import Data.String.QQ (s)
-import Niv.Logger
-import Niv.GitHub
-import Niv.Update
-import System.Exit (ExitCode(ExitSuccess))
-import System.FilePath ((</>), takeDirectory)
-import System.Process (readProcessWithExitCode)
-import UnliftIO
+import Data.Text.Extended
 import Data.Version (showVersion)
+import Niv.Cmd
+import Niv.Git.Cmd
+import Niv.GitHub.Cmd
+import Niv.Logger
+import Niv.Sources
+import Niv.Update
+import System.Environment (getArgs)
+import System.FilePath (takeDirectory)
+import UnliftIO
 import qualified Data.Aeson as Aeson
-import qualified Data.Aeson.Encode.Pretty as AesonPretty
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
-import qualified Data.ByteString.Lazy as L
 import qualified Data.HashMap.Strict as HMS
 import qualified Data.Text as T
-import qualified Data.Text.IO as T
 import qualified Options.Applicative as Opts
 import qualified Options.Applicative.Help.Pretty as Opts
 import qualified System.Directory as Dir
@@ -41,9 +39,14 @@ import qualified System.Directory as Dir
 import Paths_niv (version)
 
 cli :: IO ()
-cli = join $ Opts.execParser opts
+cli = join $
+    execParserPure' Opts.defaultPrefs opts <$> getArgs
+      >>= Opts.handleParseResult
   where
-    opts = Opts.info (parseCommand <**> Opts.helper) $ mconcat desc
+    execParserPure' pprefs pinfo [] = Opts.Failure $
+      Opts.parserFailure pprefs pinfo Opts.ShowHelpText mempty
+    execParserPure' pprefs pinfo args = Opts.execParserPure pprefs pinfo args
+    opts = Opts.info (parseCommand <**> Opts.helper ) $ mconcat desc
     desc =
       [ Opts.fullDesc
       , Opts.headerDoc $ Just $
@@ -61,103 +64,12 @@ parseCommand = Opts.subparser (
     Opts.command "modify"  parseCmdModify <>
     Opts.command "drop"  parseCmdDrop )
 
-newtype Sources = Sources
-  { unSources :: HMS.HashMap PackageName PackageSpec }
-  deriving newtype (FromJSON, ToJSON)
-
-getSources :: IO Sources
-getSources = do
-    exists <- Dir.doesFileExist pathNixSourcesJson
-    unless exists abortSourcesDoesntExist
-
-    warnIfOutdated
-    -- TODO: if doesn't exist: run niv init
-    say $ "Reading sources file"
-    decodeFileStrict pathNixSourcesJson >>= \case
-      Just (Aeson.Object obj) ->
-        fmap (Sources . mconcat) $
-          forM (HMS.toList obj) $ \(k, v) ->
-            case v of
-              Aeson.Object v' ->
-                pure $ HMS.singleton (PackageName k) (PackageSpec v')
-              _ -> abortAttributeIsntAMap
-      Just _ -> abortSourcesIsntAMap
-      Nothing -> abortSourcesIsntJSON
-
-setSources :: Sources -> IO ()
-setSources sources = encodeFile pathNixSourcesJson sources
-
-newtype PackageName = PackageName { unPackageName :: T.Text }
-  deriving newtype (Eq, Hashable, FromJSONKey, ToJSONKey, Show)
-
 parsePackageName :: Opts.Parser PackageName
 parsePackageName = PackageName <$>
     Opts.argument Opts.str (Opts.metavar "PACKAGE")
 
-newtype PackageSpec = PackageSpec { unPackageSpec :: Aeson.Object }
-  deriving newtype (FromJSON, ToJSON, Show, Semigroup, Monoid)
-
--- | Simply discards the 'Freedom'
-attrsToSpec :: Attrs -> PackageSpec
-attrsToSpec = PackageSpec . fmap snd
-
-parsePackageSpec :: Opts.Parser PackageSpec
-parsePackageSpec =
-    (PackageSpec . HMS.fromList . fmap fixupAttributes) <$>
-      many parseAttribute
-  where
-    parseAttribute :: Opts.Parser (T.Text, T.Text)
-    parseAttribute =
-      Opts.option (Opts.maybeReader parseKeyVal)
-        ( Opts.long "attribute" <>
-          Opts.short 'a' <>
-          Opts.metavar "KEY=VAL" <>
-          Opts.help "Set the package spec attribute <KEY> to <VAL>"
-        ) <|> shortcutAttributes <|>
-      (("url_template",) <$> Opts.strOption
-        ( Opts.long "template" <>
-          Opts.short 't' <>
-          Opts.metavar "URL" <>
-          Opts.help "Used during 'update' when building URL. Occurrences of <foo> are replaced with attribute 'foo'."
-        )) <|>
-      (("type",) <$> Opts.strOption
-        ( Opts.long "type" <>
-          Opts.short 'T' <>
-          Opts.metavar "TYPE" <>
-          Opts.help "The type of the URL target. The value can be either 'file' or 'tarball'. If not set, the value is inferred from the suffix of the URL."
-        ))
-
-    -- Parse "key=val" into ("key", "val")
-    parseKeyVal :: String -> Maybe (T.Text, T.Text)
-    parseKeyVal str = case span (/= '=') str of
-      (key, '=':val) -> Just (T.pack key, T.pack val)
-      _ -> Nothing
-
-    -- Shortcuts for common attributes
-    shortcutAttributes :: Opts.Parser (T.Text, T.Text)
-    shortcutAttributes = foldr (<|>) empty $ mkShortcutAttribute <$>
-      [ "branch", "owner", "repo", "version" ]
-
-    -- TODO: infer those shortcuts from 'Update' keys
-    mkShortcutAttribute :: T.Text -> Opts.Parser (T.Text, T.Text)
-    mkShortcutAttribute = \case
-      attr@(T.uncons -> Just (c,_)) -> (attr,) <$> Opts.strOption
-        ( Opts.long (T.unpack attr) <>
-          Opts.short c <>
-          Opts.metavar (T.unpack $ T.toUpper attr) <>
-          Opts.help
-            ( T.unpack $
-              "Equivalent to --attribute " <>
-              attr <> "=<" <> (T.toUpper attr) <> ">"
-            )
-        )
-      _ -> empty
-
-    fixupAttributes :: (T.Text, T.Text) -> (T.Text, Aeson.Value)
-    fixupAttributes (k, v) = (k, Aeson.String v)
-
 parsePackage :: Opts.Parser (PackageName, PackageSpec)
-parsePackage = (,) <$> parsePackageName <*> parsePackageSpec
+parsePackage = (,) <$> parsePackageName <*> (parsePackageSpec githubCmd)
 
 -------------------------------------------------------------------------------
 -- INIT
@@ -193,17 +105,28 @@ cmdInit = do
               createFile path initNixSourcesJsonContent
               -- Imports @niv@ (iohk fork), @nixpkgs@ (19.03) and @gitignore@
               say "Importing 'niv' ..."
-              cmdAdd
-                Nothing
-                ( PackageName "input-output-hk/niv"
-                , PackageSpec (HMS.singleton "branch" "iohk"))
+              cmdAdd (updateCmd githubCmd) (PackageName "niv")
+                (specToFreeAttrs $ PackageSpec $ HMS.fromList
+                  [ "owner" .= ("input-output-hk" :: T.Text)
+                  , "repo" .= ("niv" :: T.Text)
+                  , "branch" .= ("iohk" :: T.Text)
+                  ]
+                )
               say "Importing 'nixpkgs' ..."
-              cmdAdd
-                (Just (PackageName "nixpkgs"))
-                ( PackageName "NixOS/nixpkgs-channels"
-                , PackageSpec (HMS.singleton "branch" "nixos-19.03"))
+              cmdAdd (updateCmd githubCmd) (PackageName "nixpkgs")
+                (specToFreeAttrs $ PackageSpec $ HMS.fromList
+                  [ "owner" .= ("NixOS" :: T.Text)
+                  , "repo" .= ("nixpkgs-channels" :: T.Text)
+                  , "branch" .= ("nixos-19.03" :: T.Text)
+                  ]
+                )
               say "Importing 'gitignore' ..."
-              cmdAdd Nothing (PackageName "hercules-ci/gitignore", PackageSpec HMS.empty)
+              cmdAdd (updateCmd githubCmd) (PackageName "gitignore")
+                (specToFreeAttrs $ PackageSpec $ HMS.fromList
+                  [ "owner" .= ("hercules-ci" :: T.Text)
+                  , "repo" .= ("gitignore" :: T.Text)
+                  ]
+                )
           , \path _content -> dontCreateFile path)
         ] $ \(path, onCreate, onUpdate) -> do
             exists <- Dir.doesFileExist path
@@ -224,59 +147,91 @@ cmdInit = do
 
 parseCmdAdd :: Opts.ParserInfo (IO ())
 parseCmdAdd =
-    Opts.info ((cmdAdd <$> optName <*> parsePackage) <**> Opts.helper) $
-      mconcat desc
+    Opts.info
+      ((parseCommands <|> parseShortcuts) <**> Opts.helper) $
+      (description githubCmd)
   where
-    optName :: Opts.Parser (Maybe PackageName)
-    optName = Opts.optional $ PackageName <$>  Opts.strOption
+    -- XXX: this should parse many shortcuts (github, git). Right now we only
+    -- parse GitHub because the git interface is still experimental.  note to
+    -- implementer: it'll be tricky to have the correct arguments show up
+    -- without repeating "PACKAGE PACKAGE PACKAGE" for every package type.
+    parseShortcuts = parseShortcut githubCmd
+    parseShortcut cmd = uncurry (cmdAdd (updateCmd cmd)) <$> (parseShortcutArgs cmd)
+    parseCmd cmd = uncurry (cmdAdd (updateCmd cmd)) <$> (parseCmdArgs cmd)
+    parseCmdAddGit =
+      Opts.info (parseCmd gitCmd <**> Opts.helper) (description gitCmd)
+    parseCmdAddGitHub =
+      Opts.info (parseCmd githubCmd <**> Opts.helper) (description githubCmd)
+    parseCommands = Opts.subparser
+        ( Opts.hidden <>
+          Opts.commandGroup "Experimental commands:" <>
+          Opts.command "git" parseCmdAddGit <>
+          Opts.command "github" parseCmdAddGitHub
+        )
+
+-- | only used in shortcuts (niv add foo/bar ...) because PACKAGE is NOT
+-- optional
+parseShortcutArgs :: Cmd -> Opts.Parser (PackageName, Attrs)
+parseShortcutArgs cmd = collapse <$> parseNameAndShortcut <*> parsePackageSpec cmd
+  where
+    collapse specAndName pspec = (pname, specToLockedAttrs $ pspec <> baseSpec)
+      where
+        (pname, baseSpec) = case specAndName of
+          ((_, spec), Just pname') -> (pname', PackageSpec spec)
+          ((pname', spec), Nothing) -> (pname', PackageSpec spec)
+    parseNameAndShortcut =
+      (,) <$>
+        Opts.argument
+          (Opts.maybeReader (parseCmdShortcut cmd . T.pack))
+          (Opts.metavar "PACKAGE") <*>
+        optName
+    optName = Opts.optional $ PackageName <$> Opts.strOption
       ( Opts.long "name" <>
         Opts.short 'n' <>
         Opts.metavar "NAME" <>
         Opts.help "Set the package name to <NAME>"
       )
-    desc =
-      [ Opts.fullDesc
-      , Opts.progDesc "Add dependency"
-      , Opts.headerDoc $ Just $
-          "Examples:" Opts.<$$>
-          "" Opts.<$$>
-          "  niv add stedolan/jq" Opts.<$$>
-          "  niv add NixOS/nixpkgs-channels -n nixpkgs -b nixos-19.03" Opts.<$$>
-          "  niv add my-package -v alpha-0.1 -t http://example.com/archive/<version>.zip"
-      ]
 
-cmdAdd :: Maybe PackageName -> (PackageName, PackageSpec) -> IO ()
-cmdAdd mPackageName (PackageName str, cliSpec) =
-    job ("Adding package " <> T.unpack str)  $ do
+-- | only used in command (niv add <cmd> ...) because PACKAGE is optional
+parseCmdArgs :: Cmd -> Opts.Parser (PackageName, Attrs)
+parseCmdArgs cmd = collapse <$> parseNameAndShortcut <*> parsePackageSpec cmd
+  where
+    collapse specAndName pspec = (pname, specToLockedAttrs $ pspec <> baseSpec)
+      where
+        (pname, baseSpec) = case specAndName of
+          (Just (_, spec), Just pname') -> (pname', PackageSpec spec)
+          (Just (pname', spec), Nothing) -> (pname', PackageSpec spec)
+          (Nothing, Just pname') -> (pname', PackageSpec HMS.empty)
+          (Nothing, Nothing) -> (PackageName "unnamed", PackageSpec HMS.empty)
+    parseNameAndShortcut =
+      (,) <$>
+        Opts.optional (Opts.argument
+          (Opts.maybeReader (parseCmdShortcut cmd . T.pack))
+          (Opts.metavar "PACKAGE")) <*>
+        optName
+    optName = Opts.optional $ PackageName <$> Opts.strOption
+      ( Opts.long "name" <>
+        Opts.short 'n' <>
+        Opts.metavar "NAME" <>
+        Opts.help "Set the package name to <NAME>"
+      )
 
-      -- Figures out the owner and repo
-      let (packageName, defaultSpec) = case T.span (/= '/') str of
-            ( owner@(T.null -> False)
-              , T.uncons -> Just ('/', repo@(T.null -> False))) -> do
-              (PackageName repo, HMS.fromList [ "owner" .= owner, "repo" .= repo ])
-            _ -> (PackageName str, HMS.empty)
-
+cmdAdd :: Update () a -> PackageName -> Attrs -> IO ()
+cmdAdd updateFunc packageName attrs = do
+    job ("Adding package " <> T.unpack (unPackageName packageName)) $ do
       sources <- unSources <$> getSources
 
-      let packageName' = fromMaybe packageName mPackageName
+      when (HMS.member packageName sources) $
+        abortCannotAddPackageExists packageName
 
-      when (HMS.member packageName' sources) $
-        abortCannotAddPackageExists packageName'
-
-      let defaultSpec' = PackageSpec $ defaultSpec
-
-      let initialSpec = specToLockedAttrs cliSpec <> specToFreeAttrs defaultSpec'
-
-      eFinalSpec <- fmap attrsToSpec <$> tryEvalUpdate
-        initialSpec
-        (githubUpdate nixPrefetchURL githubLatestRev githubRepo)
+      eFinalSpec <- fmap attrsToSpec <$> tryEvalUpdate attrs updateFunc
 
       case eFinalSpec of
-        Left e -> abortUpdateFailed [(packageName', e)]
+        Left e -> abortUpdateFailed [(packageName, e)]
         Right finalSpec -> do
           say $ "Writing new sources file"
           setSources $ Sources $
-            HMS.insert packageName' finalSpec sources
+            HMS.insert packageName finalSpec sources
 
 -------------------------------------------------------------------------------
 -- SHOW
@@ -292,31 +247,24 @@ parseCmdShow =
 cmdShow :: Maybe PackageName -> IO ()
 cmdShow = \case
     Just packageName -> do
-      tsay $ "Showing package " <> unPackageName packageName
-
       sources <- unSources <$> getSources
 
       case HMS.lookup packageName sources of
-        Just (PackageSpec spec) -> do
-          forM_ (HMS.toList spec) $ \(attrName, attrValValue) -> do
-            let attrValue = case attrValValue of
-                  Aeson.String str -> str
-                  _ -> "<barabajagal>"
-            tsay $ "  " <> attrName <> ": " <> attrValue
+        Just pspec -> showPackage packageName pspec
         Nothing -> abortCannotShowNoSuchPackage packageName
 
     Nothing -> do
-      say $ "Showing sources file"
-
       sources <- unSources <$> getSources
+      forWithKeyM_ sources $ showPackage
 
-      forWithKeyM_ sources $ \key (PackageSpec spec) -> do
-        tsay $ "Showing " <> tbold (unPackageName key)
-        forM_ (HMS.toList spec) $ \(attrName, attrValValue) -> do
-          let attrValue = case attrValValue of
-                Aeson.String str -> str
-                _ -> tfaint "<barabajagal>"
-          tsay $ "  " <> attrName <> ": " <> attrValue
+showPackage :: PackageName -> PackageSpec -> IO ()
+showPackage (PackageName pname) (PackageSpec spec) = do
+    tsay $ tbold pname
+    forM_ (HMS.toList spec) $ \(attrName, attrValValue) -> do
+      let attrValue = case attrValValue of
+            Aeson.String str -> str
+            _ -> tfaint "<barabajagal>"
+      tsay $ "  " <> attrName <> ": " <> attrValue
 
 -------------------------------------------------------------------------------
 -- UPDATE
@@ -331,12 +279,14 @@ parseCmdUpdate =
     desc =
       [ Opts.fullDesc
       , Opts.progDesc "Update dependencies"
-      , Opts.headerDoc $ Just $
+      , Opts.headerDoc $ Just $ Opts.nest 2 $
           "Examples:" Opts.<$$>
           "" Opts.<$$>
-          "  niv update" Opts.<$$>
-          "  niv update nixpkgs" Opts.<$$>
-          "  niv update my-package -v beta-0.2"
+          Opts.vcat
+            [ Opts.fill 30 "niv update" Opts.<+> "# update all packages",
+              Opts.fill 30 "niv update nixpkgs" Opts.<+> "# update nixpkgs",
+              Opts.fill 30 "niv update my-package -v beta-0.2" Opts.<+> "# update my-package to version \"beta-0.2\""
+            ]
       ]
 
 specToFreeAttrs :: PackageSpec -> Attrs
@@ -345,7 +295,6 @@ specToFreeAttrs = fmap (Free,) . unPackageSpec
 specToLockedAttrs :: PackageSpec -> Attrs
 specToLockedAttrs = fmap (Locked,) . unPackageSpec
 
--- TODO: sexy logging + concurrent updates
 cmdUpdate :: Maybe (PackageName, PackageSpec) -> IO ()
 cmdUpdate = \case
     Just (packageName, cliSpec) ->
@@ -354,9 +303,14 @@ cmdUpdate = \case
 
         eFinalSpec <- case HMS.lookup packageName sources of
           Just defaultSpec -> do
+            -- lookup the "type" to find a Cmd to run, defaulting to legacy
+            -- github
+            let cmd = case HMS.lookup "type" (unPackageSpec defaultSpec) of
+                  Just "git" -> gitCmd
+                  _ -> githubCmd
             fmap attrsToSpec <$> tryEvalUpdate
               (specToLockedAttrs cliSpec <> specToFreeAttrs defaultSpec)
-              (githubUpdate nixPrefetchURL githubLatestRev githubRepo)
+              (updateCmd cmd)
 
           Nothing -> abortCannotUpdateNoSuchPackage packageName
 
@@ -373,9 +327,14 @@ cmdUpdate = \case
         \packageName defaultSpec -> do
           tsay $ "Package: " <> unPackageName packageName
           let initialSpec = specToFreeAttrs defaultSpec
+          -- lookup the "type" to find a Cmd to run, defaulting to legacy
+          -- github
+          let cmd = case HMS.lookup "type" (unPackageSpec defaultSpec) of
+                Just "git" -> gitCmd
+                _ -> githubCmd
           finalSpec <- fmap attrsToSpec <$> tryEvalUpdate
             initialSpec
-            (githubUpdate nixPrefetchURL githubLatestRev githubRepo)
+            (updateCmd cmd)
           pure finalSpec
 
       let (failed, sources') = partitionEithersHMS esources'
@@ -475,74 +434,6 @@ cmdDrop packageName = \case
         HMS.insert packageName packageSpec sources
 
 -------------------------------------------------------------------------------
--- Aux
--------------------------------------------------------------------------------
-
---- Aeson
-
--- | Efficiently deserialize a JSON value from a file.
--- If this fails due to incomplete or invalid input, 'Nothing' is
--- returned.
---
--- The input file's content must consist solely of a JSON document,
--- with no trailing data except for whitespace.
---
--- This function parses immediately, but defers conversion.  See
--- 'json' for details.
-decodeFileStrict :: (FromJSON a) => FilePath -> IO (Maybe a)
-decodeFileStrict = fmap Aeson.decodeStrict . B.readFile
-
--- | Efficiently serialize a JSON value as a lazy 'L.ByteString' and write it to a file.
-encodeFile :: (ToJSON a) => FilePath -> a -> IO ()
-encodeFile fp = L.writeFile fp . AesonPretty.encodePretty' config
-  where
-    config =  AesonPretty.defConfig { AesonPretty.confTrailingNewline = True, AesonPretty.confCompare = compare }
-
---- HashMap
-
-forWithKeyM
-  :: (Eq k, Hashable k, Monad m)
-  => HMS.HashMap k v1
-  -> (k -> v1 -> m v2)
-  -> m (HMS.HashMap k v2)
-forWithKeyM = flip mapWithKeyM
-
-forWithKeyM_
-  :: (Eq k, Hashable k, Monad m)
-  => HMS.HashMap k v1
-  -> (k -> v1 -> m ())
-  -> m ()
-forWithKeyM_ = flip mapWithKeyM_
-
-mapWithKeyM
-  :: (Eq k, Hashable k, Monad m)
-  => (k -> v1 -> m v2)
-  -> HMS.HashMap k v1
-  -> m (HMS.HashMap k v2)
-mapWithKeyM f m = do
-    fmap mconcat $ forM (HMS.toList m) $ \(k, v) ->
-      HMS.singleton k <$> f k v
-
-mapWithKeyM_
-  :: (Eq k, Hashable k, Monad m)
-  => (k -> v1 -> m ())
-  -> HMS.HashMap k v1
-  -> m ()
-mapWithKeyM_ f m = do
-    forM_ (HMS.toList m) $ \(k, v) ->
-      HMS.singleton k <$> f k v
-
-nixPrefetchURL :: Bool -> T.Text -> IO T.Text
-nixPrefetchURL unpack (T.unpack -> url) = do
-    (exitCode, sout, serr) <- runNixPrefetch
-    case (exitCode, lines sout) of
-      (ExitSuccess, l:_)  -> pure $ T.pack l
-      _ -> abortNixPrefetchExpectedOutput (T.pack sout) (T.pack serr)
-  where
-    args = if unpack then ["--unpack", url] else [url]
-    runNixPrefetch = readProcessWithExitCode "nix-prefetch-url" args ""
-
--------------------------------------------------------------------------------
 -- Files and their content
 -------------------------------------------------------------------------------
 
@@ -563,52 +454,9 @@ shouldUpdateNixSourcesNix content =
           _ -> False
         _ -> False
 
-warnIfOutdated :: IO ()
-warnIfOutdated = do
-    tryAny (B.readFile pathNixSourcesNix) >>= \case
-      Left e -> T.putStrLn $ T.unlines
-        [ "Could not read " <> T.pack pathNixSourcesNix
-        , "Error: " <> tshow e
-        ]
-      Right content ->
-        if shouldUpdateNixSourcesNix content
-        then
-          T.putStrLn $ T.unlines
-            [ "WARNING: " <> T.pack pathNixSourcesNix <> " is out of date."
-            , "Please run"
-            , "  niv init"
-            , "or add the following line in the " <> T.pack pathNixSourcesNix <> "  file:"
-            , "  # niv: no_update"
-            ]
-        else pure ()
-
--- | @nix/sources.nix@
-pathNixSourcesNix :: FilePath
-pathNixSourcesNix = "nix" </> "sources.nix"
-
--- | Glue code between nix and sources.json
-initNixSourcesNixContent :: B.ByteString
-initNixSourcesNixContent = $(embedFile "nix/sources.nix")
-
--- | @nix/sources.json"
-pathNixSourcesJson :: FilePath
-pathNixSourcesJson = "nix" </> "sources.json"
-
--- | Empty JSON map
-initNixSourcesJsonContent :: B.ByteString
-initNixSourcesJsonContent = "{}"
-
 -------------------------------------------------------------------------------
 -- Abort
 -------------------------------------------------------------------------------
-
-abortSourcesDoesntExist :: IO a
-abortSourcesDoesntExist = abort $ T.unlines [ line1, line2 ]
-  where
-    line1 = "Cannot use " <> T.pack pathNixSourcesJson
-    line2 = [s|
-The sources file does not exist! You may need to run 'niv init'.
-|]
 
 abortSourcesIsntAMap :: IO a
 abortSourcesIsntAMap = abort $ T.unlines [ line1, line2 ]
@@ -619,22 +467,6 @@ The sources file should be a JSON map from package name to package
 specification, e.g.:
   { ... }
 |]
-
-abortAttributeIsntAMap :: IO a
-abortAttributeIsntAMap = abort $ T.unlines [ line1, line2 ]
-  where
-    line1 = "Cannot use " <> T.pack pathNixSourcesJson
-    line2 = [s|
-The package specifications in the sources file should be JSON maps from
-attribute name to attribute value, e.g.:
-  { "nixpkgs": { "foo": "bar" } }
-|]
-
-abortSourcesIsntJSON :: IO a
-abortSourcesIsntJSON = abort $ T.unlines [ line1, line2 ]
-  where
-    line1 = "Cannot use " <> T.pack pathNixSourcesJson
-    line2 = "The sources file should be JSON."
 
 abortCannotAddPackageExists :: PackageName -> IO a
 abortCannotAddPackageExists (PackageName n) = abort $ T.unlines
@@ -686,13 +518,3 @@ abortUpdateFailed errs = abort $ T.unlines $
     map (\(PackageName pname, e) ->
       pname <> ": " <> tshow e
     ) errs
-
-abortNixPrefetchExpectedOutput :: T.Text -> T.Text -> IO a
-abortNixPrefetchExpectedOutput sout serr = abort $ [s|
-Could not read the output of 'nix-prefetch-url'. This is a bug. Please create a
-ticket:
-
-  https://github.com/nmattia/niv/issues/new
-
-Thanks! I'll buy you a beer.
-|] <> T.unlines ["stdout: ", sout, "stderr: ", serr]
